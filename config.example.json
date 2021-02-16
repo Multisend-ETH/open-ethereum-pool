@@ -104,7 +104,8 @@
 		"gasPrice": "50000000000",
 		"autoGas": true,
 		"threshold": 500000000,
-		"bgsave": false
+		"bgsave": false,
+		"multisendAddress": "0x941F40C2955EE09ba638409F67ef27C531fc055C"
 	},
 
 	"newrelicEnabled": false,
