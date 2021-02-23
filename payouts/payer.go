@@ -53,6 +53,12 @@ type PayoutsProcessor struct {
 	lastFail error
 }
 
+type PayeeAmount struct {
+	amountShanonInt64 int64
+	amountShanon      *big.Int
+	amountWei         *big.Int
+}
+
 func NewPayoutsProcessor(cfg *PayoutsConfig, backend *storage.RedisClient) *PayoutsProcessor {
 	u := &PayoutsProcessor{config: cfg, backend: backend}
 	u.rpc = rpc.NewRPCClient("PayoutsProcessor", cfg.Daemon, cfg.Timeout)
@@ -110,157 +116,163 @@ func (u *PayoutsProcessor) process() {
 		log.Println("Payments suspended due to last critical error:", u.lastFail)
 		return
 	}
-	// mustPay := 0
-	// minersPaid := 0
-	// totalAmount := big.NewInt(0)
+	mustPay := 0
+	minersPaid := 0
+	totalAmount := big.NewInt(0)
 	payees, err := u.backend.GetPayees()
 	if err != nil {
 		log.Println("Error while retrieving payees from backend:", err)
 		return
 	}
 
+	if !u.checkPeers() {
+		log.Println("Peers not connected, abort Payment!", err)
+		return
+	}
+
+	if !u.isUnlockedAccount() {
+		log.Println("Account is locked, abort payment!", err)
+		return
+	}
+
+	poolBalance, err := u.rpc.GetBalance(u.config.Address)
+	if err != nil {
+		u.halt = true
+		u.lastFail = err
+		return
+	}
+	remainingPoolBalance := poolBalance
+
+	validPayees := map[string]PayeeAmount{}
+
 	addresses := []string{}
 	amounts := []string{}
-	payeesAmounts := []int64{}
 	batchIndex := 0
-	for i, login := range payees {
+	multisendBatch := 100
+
+	for _, login := range payees {
 		amount, _ := u.backend.GetBalance(login)
 		amountInShannon := big.NewInt(amount)
-		payeesAmounts = append(payeesAmounts, amount)
+
 		// Shannon^2 = Wei
 		amountInWei := new(big.Int).Mul(amountInShannon, util.Shannon)
+
+		if !u.reachedThreshold(amountInShannon) {
+			continue
+		}
+		mustPay++
+
+		if remainingPoolBalance.Cmp(amountInWei) < 0 {
+			err := fmt.Errorf("Not enough balance for payment, need %s Wei, pool has %s Wei",
+				amountInWei.String(), poolBalance.String())
+			u.halt = true
+			u.lastFail = err
+			break
+		}
+
+		remainingPoolBalance.Sub(remainingPoolBalance, amountInWei)
+
+		// Lock payments for current payout
+		err = u.backend.LockPayouts(login, amount)
+		if err != nil {
+			log.Printf("Failed to lock payment for %s: %v", login, err)
+			u.halt = true
+			u.lastFail = err
+			break
+		}
+		log.Printf("Locked payment for %s, %v Shannon", login, amount)
+
+		// Debit miner's balance and update stats
+		err = u.backend.UpdateBalance(login, amount)
+		if err != nil {
+			log.Printf("Failed to update balance for %s, %v Shannon: %v", login, amount, err)
+			u.halt = true
+			u.lastFail = err
+			break
+		}
+
+		payeeAmount := PayeeAmount{
+			amountShanonInt64: amount,
+			amountShanon:      amountInShannon,
+			amountWei:         amountInWei,
+		}
+
+		validPayees[login] = payeeAmount
 		addresses = append(addresses, login)
 		amounts = append(amounts, amountInWei.String())
 
-		if ((i+1)%100) == 0 || i+1 == len(payees) {
+		if ((len(addresses))%multisendBatch) == 0 || len(addresses) == len(payees)-batchIndex*multisendBatch {
+
 			_addresses := [100]string{}
 			_amounts := [100]string{}
-			copy(_addresses[:], addresses[:4])
-			copy(_amounts[:], amounts[:4])
+			copy(_addresses[:], addresses[:100])
+			copy(_amounts[:], amounts[:100])
+
 			callData := multisendvy.MultisendWeiData(context.Background(), _addresses, _amounts)
 			data := &multisendvy.RPCSendETHTransactionCallData{
 				From:     u.config.Address,
 				To:       u.config.MultisendAddress,
 				Value:    callData.Value.String(),
 				Data:     hexutil.Encode(callData.Data),
-				Gas:      "3000000",
+				Gas:      u.config.Gas, //recommended: "3000000",
 				GasPrice: u.config.GasPrice,
 			}
 			txHash, err := multisendvy.RPCSendETHTransaction(u.config.Daemon, data)
-			fmt.Println(txHash, err)
+			if err != nil {
+				log.Println("Failed to send batch transaction for batch: [", batchIndex+1, "] of ", validPayees)
+				log.Println("Batch transaction error: ", err)
+				u.halt = true
+				u.lastFail = err
+				break
+			}
+			log.Println("Multisend Transaction Hash: ", txHash)
+
+			for _, address := range addresses {
+				// log payment
+				err = u.backend.WritePayment(address, txHash, validPayees[address].amountShanonInt64)
+				if err != nil {
+					log.Printf("Failed to log payment data for %s, %v Shannon, tx: %s: %v", address, amount, txHash, err)
+					u.halt = true
+					u.lastFail = err
+					break
+				}
+				for {
+					log.Printf("Waiting for tx confirmation: %v", txHash)
+					time.Sleep(txCheckInterval)
+					receipt, err := u.rpc.GetTxReceipt(txHash)
+					if err != nil {
+						log.Printf("Failed to get tx receipt for %v: %v", txHash, err)
+						continue
+					}
+					// Tx has been mined
+					if receipt != nil && receipt.Confirmed() {
+						if receipt.Successful() {
+							log.Printf("Payout tx successful for %s: %s", login, txHash)
+						} else {
+							log.Printf("Payout tx failed for %s: %s. Address contract throws on incoming tx.", login, txHash)
+						}
+						break
+					}
+				}
+			}
+			minersPaid += len(addresses)
+			addresses = []string{}
+			amounts = []string{}
 			batchIndex++
 		}
+
 	}
 
-	// for _, login := range payees {
-	// 	amount, _ := u.backend.GetBalance(login)
-	// 	amountInShannon := big.NewInt(amount)
+	if mustPay > 0 {
+		log.Printf("Paid total %v Shannon to %v of %v payees", totalAmount, minersPaid, mustPay)
+	} else {
+		log.Println("No payees that have reached payout threshold")
+	}
 
-	// 	// Shannon^2 = Wei
-	// 	amountInWei := new(big.Int).Mul(amountInShannon, util.Shannon)
-
-	// 	if !u.reachedThreshold(amountInShannon) {
-	// 		continue
-	// 	}
-	// 	mustPay++
-
-	// 	// Require active peers before processing
-	// 	if !u.checkPeers() {
-	// 		break
-	// 	}
-	// 	// Require unlocked account
-	// 	if !u.isUnlockedAccount() {
-	// 		break
-	// 	}
-
-	// 	// Check if we have enough funds
-	// 	poolBalance, err := u.rpc.GetBalance(u.config.Address)
-	// 	if err != nil {
-	// 		u.halt = true
-	// 		u.lastFail = err
-	// 		break
-	// 	}
-	// 	if poolBalance.Cmp(amountInWei) < 0 {
-	// 		err := fmt.Errorf("Not enough balance for payment, need %s Wei, pool has %s Wei",
-	// 			amountInWei.String(), poolBalance.String())
-	// 		u.halt = true
-	// 		u.lastFail = err
-	// 		break
-	// 	}
-
-	// 	// Lock payments for current payout
-	// 	err = u.backend.LockPayouts(login, amount)
-	// 	if err != nil {
-	// 		log.Printf("Failed to lock payment for %s: %v", login, err)
-	// 		u.halt = true
-	// 		u.lastFail = err
-	// 		break
-	// 	}
-	// 	log.Printf("Locked payment for %s, %v Shannon", login, amount)
-
-	// 	// Debit miner's balance and update stats
-	// 	err = u.backend.UpdateBalance(login, amount)
-	// 	if err != nil {
-	// 		log.Printf("Failed to update balance for %s, %v Shannon: %v", login, amount, err)
-	// 		u.halt = true
-	// 		u.lastFail = err
-	// 		break
-	// 	}
-
-	// 	value := hexutil.EncodeBig(amountInWei)
-	// 	txHash, err := u.rpc.SendTransaction(u.config.Address, login, u.config.GasHex(), u.config.GasPriceHex(), value, u.config.AutoGas)
-	// 	if err != nil {
-	// 		log.Printf("Failed to send payment to %s, %v Shannon: %v. Check outgoing tx for %s in block explorer and docs/PAYOUTS.md",
-	// 			login, amount, err, login)
-	// 		u.halt = true
-	// 		u.lastFail = err
-	// 		break
-	// 	}
-
-	// 	// Log transaction hash
-	// 	err = u.backend.WritePayment(login, txHash, amount)
-	// 	if err != nil {
-	// 		log.Printf("Failed to log payment data for %s, %v Shannon, tx: %s: %v", login, amount, txHash, err)
-	// 		u.halt = true
-	// 		u.lastFail = err
-	// 		break
-	// 	}
-
-	// 	minersPaid++
-	// 	totalAmount.Add(totalAmount, big.NewInt(amount))
-	// 	log.Printf("Paid %v Shannon to %v, TxHash: %v", amount, login, txHash)
-
-	// 	// Wait for TX confirmation before further payouts
-	// 	for {
-	// 		log.Printf("Waiting for tx confirmation: %v", txHash)
-	// 		time.Sleep(txCheckInterval)
-	// 		receipt, err := u.rpc.GetTxReceipt(txHash)
-	// 		if err != nil {
-	// 			log.Printf("Failed to get tx receipt for %v: %v", txHash, err)
-	// 			continue
-	// 		}
-	// 		// Tx has been mined
-	// 		if receipt != nil && receipt.Confirmed() {
-	// 			if receipt.Successful() {
-	// 				log.Printf("Payout tx successful for %s: %s", login, txHash)
-	// 			} else {
-	// 				log.Printf("Payout tx failed for %s: %s. Address contract throws on incoming tx.", login, txHash)
-	// 			}
-	// 			break
-	// 		}
-	// 	}
-	// }
-
-	// if mustPay > 0 {
-	// 	log.Printf("Paid total %v Shannon to %v of %v payees", totalAmount, minersPaid, mustPay)
-	// } else {
-	// 	log.Println("No payees that have reached payout threshold")
-	// }
-
-	// // Save redis state to disk
-	// if minersPaid > 0 && u.config.BgSave {
-	// 	u.bgSave()
-	// }
+	// Save redis state to disk
+	if minersPaid > 0 && u.config.BgSave {
+		u.bgSave()
+	}
 }
 
 func (self PayoutsProcessor) isUnlockedAccount() bool {
